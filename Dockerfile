@@ -10,7 +10,4 @@ COPY server.js .
 
 EXPOSE 443
 
-CMD [
-  "npm",
-  "start"
-]
+CMD ["npm", "start"]
