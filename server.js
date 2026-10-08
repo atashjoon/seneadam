@@ -1,84 +1,176 @@
 import net from "net";
 
-const PORT = process.env.PORT || 443;
-
-const TARGET_HOST =
-  process.env.TARGET_HOST || "";
-
-const TARGET_PORT =
-  Number(process.env.TARGET_PORT || 443);
-
+const PORT = Number(process.env.PORT || 443);
 
 console.log("=================================");
-console.log("Trendify Nexus TCP Relay");
+console.log("Trendify Nexus Dynamic TCP Relay");
 console.log("PORT:", PORT);
-console.log("TARGET:", TARGET_HOST, TARGET_PORT);
+console.log("MODE: DYNAMIC");
 console.log("=================================");
 
 
 const server = net.createServer((client) => {
 
   console.log(
-    "NEW CLIENT",
+    "CLIENT CONNECTED",
     client.remoteAddress,
     client.remotePort
   );
 
 
-  if (!TARGET_HOST) {
+  let header = Buffer.alloc(0);
+  let connected = false;
+  let remote = null;
+
+
+  function connectTarget(host, port, firstData) {
 
     console.log(
-      "TARGET_HOST missing"
+      "CONNECT TARGET",
+      host,
+      port
     );
 
-    client.destroy();
 
-    return;
+    remote = net.connect(
+      {
+        host,
+        port
+      },
+      () => {
+
+        console.log(
+          "TARGET CONNECTED",
+          host,
+          port
+        );
+
+        connected = true;
+
+
+        if (firstData.length) {
+          remote.write(firstData);
+        }
+
+
+        client.pipe(remote);
+        remote.pipe(client);
+
+      }
+    );
+
+
+    remote.on(
+      "error",
+      err => {
+
+        console.log(
+          "REMOTE ERROR",
+          err.message
+        );
+
+        client.destroy();
+
+      }
+    );
+
+
+    remote.on(
+      "close",
+      ()=>{
+
+        client.destroy();
+
+      }
+    );
+
   }
 
 
-  const remote = net.connect(
-    {
-      host: TARGET_HOST,
-      port: TARGET_PORT
-    },
-    () => {
 
-      console.log(
-        "CONNECTED TARGET",
-        TARGET_HOST,
-        TARGET_PORT
-      );
+  client.once(
+    "data",
+    data => {
+
+
+      /*
+        Header format:
+
+        HOST_LENGTH(2 bytes)
+        HOST
+        PORT(2 bytes)
+        DATA
+      */
+
+
+      try {
+
+
+        const hostLength =
+          data.readUInt16BE(0);
+
+
+        const host =
+          data
+          .slice(
+            2,
+            2 + hostLength
+          )
+          .toString();
+
+
+        const port =
+          data.readUInt16BE(
+            2 + hostLength
+          );
+
+
+        const payload =
+          data.slice(
+            4 + hostLength
+          );
+
+
+        connectTarget(
+          host,
+          port,
+          payload
+        );
+
+
+      }
+      catch(err){
+
+
+        console.log(
+          "HEADER ERROR",
+          err.message
+        );
+
+
+        client.destroy();
+
+
+      }
+
 
     }
   );
 
 
-  client.pipe(remote);
-  remote.pipe(client);
-
-
 
   client.on(
     "error",
-    (err)=>{
+    err=>{
+
       console.log(
         "CLIENT ERROR",
         err.message
       );
-      remote.destroy();
-    }
-  );
 
 
-  remote.on(
-    "error",
-    (err)=>{
-      console.log(
-        "REMOTE ERROR",
-        err.message
-      );
-      client.destroy();
+      remote?.destroy();
+
     }
   );
 
@@ -86,17 +178,12 @@ const server = net.createServer((client) => {
   client.on(
     "close",
     ()=>{
-      remote.destroy();
+
+      remote?.destroy();
+
     }
   );
 
-
-  remote.on(
-    "close",
-    ()=>{
-      client.destroy();
-    }
-  );
 
 });
 
@@ -105,9 +192,11 @@ server.listen(
   PORT,
   "0.0.0.0",
   ()=>{
+
     console.log(
       "Relay listening on",
       PORT
     );
+
   }
 );
