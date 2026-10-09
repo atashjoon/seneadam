@@ -1,202 +1,193 @@
-import net from "net";
+
+import net from "node:net";
+import { timingSafeEqual } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 443);
+const SECRET = String(process.env.RELAY_SECRET || "");
+const MAX_SECRET_LENGTH = 256;
+const MAX_HOST_LENGTH = 255;
 
-console.log("=================================");
-console.log("Trendify Nexus Dynamic TCP Relay");
-console.log("PORT:", PORT);
-console.log("MODE: DYNAMIC");
-console.log("=================================");
+if (!SECRET) {
+  console.error("FATAL: RELAY_SECRET is required");
+  process.exit(1);
+}
 
+const expectedSecret = Buffer.from(SECRET, "utf8");
+
+if (
+  expectedSecret.length < 16 ||
+  expectedSecret.length > MAX_SECRET_LENGTH
+) {
+  console.error("FATAL: RELAY_SECRET must be 16-256 bytes");
+  process.exit(1);
+}
 
 const server = net.createServer((client) => {
+  client.setNoDelay(true);
 
-  console.log(
-    "CLIENT CONNECTED",
-    client.remoteAddress,
-    client.remotePort
-  );
-
-
-  let header = Buffer.alloc(0);
-  let connected = false;
   let remote = null;
+  let buffer = Buffer.alloc(0);
+  let stage = "secretLength";
+  let secretLength = 0;
+  let hostLength = 0;
+  let finished = false;
 
+  const headerTimer = setTimeout(() => {
+    if (stage !== "connected") client.destroy();
+  }, 10000);
 
-  function connectTarget(host, port, firstData) {
+  function reject(reason) {
+    if (finished) return;
+    finished = true;
+    clearTimeout(headerTimer);
+    console.log("RELAY REJECT:", reason);
+    client.destroy();
+    remote?.destroy();
+  }
 
-    console.log(
-      "CONNECT TARGET",
-      host,
-      port
-    );
+  function onData(chunk) {
+    if (finished) return;
 
+    buffer = Buffer.concat([buffer, chunk]);
 
-    remote = net.connect(
-      {
-        host,
-        port
-      },
-      () => {
+    while (true) {
+      if (stage === "secretLength") {
+        if (buffer.length < 2) return;
 
-        console.log(
-          "TARGET CONNECTED",
-          host,
-          port
-        );
+        secretLength = buffer.readUInt16BE(0);
+        buffer = buffer.subarray(2);
 
-        connected = true;
-
-
-        if (firstData.length) {
-          remote.write(firstData);
+        if (
+          secretLength < 16 ||
+          secretLength > MAX_SECRET_LENGTH
+        ) {
+          return reject("Invalid secret length");
         }
 
-
-        client.pipe(remote);
-        remote.pipe(client);
-
+        stage = "secret";
       }
-    );
 
+      if (stage === "secret") {
+        if (buffer.length < secretLength) return;
 
-    remote.on(
-      "error",
-      err => {
+        const receivedSecret = buffer.subarray(0, secretLength);
+        buffer = buffer.subarray(secretLength);
 
-        console.log(
-          "REMOTE ERROR",
-          err.message
-        );
+        if (
+          receivedSecret.length !== expectedSecret.length ||
+          !timingSafeEqual(receivedSecret, expectedSecret)
+        ) {
+          return reject("Authentication failed");
+        }
 
-        client.destroy();
-
+        stage = "hostLength";
       }
-    );
 
+      if (stage === "hostLength") {
+        if (buffer.length < 2) return;
 
-    remote.on(
-      "close",
-      ()=>{
+        hostLength = buffer.readUInt16BE(0);
+        buffer = buffer.subarray(2);
 
-        client.destroy();
+        if (hostLength < 1 || hostLength > MAX_HOST_LENGTH) {
+          return reject("Invalid host length");
+        }
 
+        stage = "target";
       }
-    );
 
+      if (stage === "target") {
+        if (buffer.length < hostLength + 2) return;
+
+        const host = buffer
+          .subarray(0, hostLength)
+          .toString("utf8");
+
+        const port = buffer.readUInt16BE(hostLength);
+        const initialPayload = buffer.subarray(hostLength + 2);
+
+        buffer = Buffer.alloc(0);
+        stage = "connecting";
+
+        if (
+          !host ||
+          /[\0\r\n]/.test(host) ||
+          !Number.isInteger(port) ||
+          port < 1 ||
+          port > 65535
+        ) {
+          return reject("Invalid destination");
+        }
+
+        clearTimeout(headerTimer);
+        client.pause();
+        client.removeListener("data", onData);
+
+        console.log("CONNECT TARGET:", host, port);
+
+        try {
+          remote = net.connect({ host, port });
+          remote.setNoDelay(true);
+
+          remote.once("connect", () => {
+            if (finished) {
+              remote?.destroy();
+              return;
+            }
+
+            stage = "connected";
+            console.log("TARGET CONNECTED:", host, port);
+
+            if (initialPayload.length) {
+              remote.write(initialPayload);
+            }
+
+            client.pipe(remote);
+            remote.pipe(client);
+            client.resume();
+          });
+
+          remote.on("error", (err) => {
+            console.log("REMOTE ERROR:", err.message);
+            client.destroy();
+          });
+
+          remote.on("close", () => {
+            client.destroy();
+          });
+        } catch (err) {
+          reject(err.message);
+        }
+
+        return;
+      }
+
+      return;
+    }
   }
 
+  client.on("data", onData);
 
+  client.on("error", (err) => {
+    console.log("CLIENT ERROR:", err.message);
+    remote?.destroy();
+  });
 
-  client.once(
-    "data",
-    data => {
-
-
-      /*
-        Header format:
-
-        HOST_LENGTH(2 bytes)
-        HOST
-        PORT(2 bytes)
-        DATA
-      */
-
-
-      try {
-
-
-        const hostLength =
-          data.readUInt16BE(0);
-
-
-        const host =
-          data
-          .slice(
-            2,
-            2 + hostLength
-          )
-          .toString();
-
-
-        const port =
-          data.readUInt16BE(
-            2 + hostLength
-          );
-
-
-        const payload =
-          data.slice(
-            4 + hostLength
-          );
-
-
-        connectTarget(
-          host,
-          port,
-          payload
-        );
-
-
-      }
-      catch(err){
-
-
-        console.log(
-          "HEADER ERROR",
-          err.message
-        );
-
-
-        client.destroy();
-
-
-      }
-
-
-    }
-  );
-
-
-
-  client.on(
-    "error",
-    err=>{
-
-      console.log(
-        "CLIENT ERROR",
-        err.message
-      );
-
-
-      remote?.destroy();
-
-    }
-  );
-
-
-  client.on(
-    "close",
-    ()=>{
-
-      remote?.destroy();
-
-    }
-  );
-
-
+  client.on("close", () => {
+    finished = true;
+    clearTimeout(headerTimer);
+    remote?.destroy();
+  });
 });
 
+server.on("error", (err) => {
+  console.error("SERVER ERROR:", err);
+});
 
-server.listen(
-  PORT,
-  "0.0.0.0",
-  ()=>{
-
-    console.log(
-      "Relay listening on",
-      PORT
-    );
-
-  }
-);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log("=================================");
+  console.log("Trendify Nexus Dynamic TCP Relay");
+  console.log("PORT:", PORT);
+  console.log("AUTH: enabled");
+  console.log("=================================");
+});
