@@ -40,7 +40,13 @@ const server = net.createServer((client) => {
     if (finished) return;
     finished = true;
     clearTimeout(headerTimer);
-    console.log("RELAY REJECT:", reason);
+    console.log("RELAY REJECT:", reason, {
+  receivedLength:
+    typeof receivedSecret !== "undefined"
+      ? receivedSecret.length
+      : null,
+  expectedLength: expectedSecret.length
+});
     client.destroy();
     remote?.destroy();
   }
